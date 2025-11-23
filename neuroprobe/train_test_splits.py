@@ -9,6 +9,8 @@ from .config import *
 
 def generate_splits_cross_subject(all_subjects, test_subject_id, test_trial_id, eval_name, dtype=torch.float32,
                           lite=True, nano=False,
+
+                          include_all_train_subjects=False, # if True, include all other subjects for training (defaults to False). If False, only include subject 2 trial 4
                           
                           # Dataset parameters
                           binary_tasks=True,
@@ -45,36 +47,42 @@ def generate_splits_cross_subject(all_subjects, test_subject_id, test_trial_id, 
             - val_dataset (BrainTreebankSubjectTrialBenchmarkDataset): Validation dataset
             - test_dataset (BrainTreebankSubjectTrialBenchmarkDataset): Test dataset
     """
-    assert test_subject_id != DS_DM_TRAIN_SUBJECT_ID, "Test subject cannot be the same as the training subject."
+    if include_all_train_subjects:
+        train_subject_trials = [(subject_id, trial_id) for subject_id, trial_id in NEUROPROBE_LITE_SUBJECT_TRIALS if subject_id != test_subject_id]
+    else:
+        train_subject_trials = [(DS_DM_TRAIN_SUBJECT_ID, DS_DM_TRAIN_TRIAL_ID)]
+        assert test_subject_id != DS_DM_TRAIN_SUBJECT_ID, "Test subject cannot be the same as the training subject."
 
-    test_dataset = BrainTreebankSubjectTrialBenchmarkDataset(all_subjects[test_subject_id], test_trial_id, dtype=dtype, eval_name=eval_name, 
-                                                             binary_tasks=binary_tasks, output_indices=output_indices, output_dict=output_dict, start_neural_data_before_word_onset=start_neural_data_before_word_onset, end_neural_data_after_word_onset=end_neural_data_after_word_onset,
-                                                             lite=lite, nano=nano, max_samples=max_samples)
-    
-    train_subject_id, train_trial_id = DS_DM_TRAIN_SUBJECT_ID, DS_DM_TRAIN_TRIAL_ID
-    train_dataset = BrainTreebankSubjectTrialBenchmarkDataset(all_subjects[train_subject_id], train_trial_id, dtype=dtype, eval_name=eval_name, 
+    datasets = []
+    for train_subject_id, train_trial_id in train_subject_trials:
+        test_dataset = BrainTreebankSubjectTrialBenchmarkDataset(all_subjects[test_subject_id], test_trial_id, dtype=dtype, eval_name=eval_name, 
                                                                 binary_tasks=binary_tasks, output_indices=output_indices, output_dict=output_dict, start_neural_data_before_word_onset=start_neural_data_before_word_onset, end_neural_data_after_word_onset=end_neural_data_after_word_onset,
                                                                 lite=lite, nano=nano, max_samples=max_samples)
+        
+        train_dataset = BrainTreebankSubjectTrialBenchmarkDataset(all_subjects[train_subject_id], train_trial_id, dtype=dtype, eval_name=eval_name, 
+                                                                    binary_tasks=binary_tasks, output_indices=output_indices, output_dict=output_dict, start_neural_data_before_word_onset=start_neural_data_before_word_onset, end_neural_data_after_word_onset=end_neural_data_after_word_onset,
+                                                                    lite=lite, nano=nano, max_samples=max_samples)
 
-    test_size = len(test_dataset)
-    val_size = test_size // 2
-    val_indices = list(range(val_size))
-    test_indices = list(range(val_size, test_size))
-    val_dataset = Subset(test_dataset, val_indices)
-    test_dataset = Subset(test_dataset, test_indices)
-    # copy the electrode coordinates and labels from the test dataset to the val and test datasets
-    val_dataset.electrode_coordinates = test_dataset.dataset.electrode_coordinates
-    val_dataset.electrode_labels = test_dataset.dataset.electrode_labels
-    test_dataset.electrode_coordinates = test_dataset.dataset.electrode_coordinates
-    test_dataset.electrode_labels = test_dataset.dataset.electrode_labels
+        test_size = len(test_dataset)
+        val_size = test_size // 2
+        val_indices = list(range(val_size))
+        test_indices = list(range(val_size, test_size))
+        val_dataset = Subset(test_dataset, val_indices)
+        test_dataset = Subset(test_dataset, test_indices)
+        # copy the electrode coordinates and labels from the test dataset to the val and test datasets
+        val_dataset.electrode_coordinates = test_dataset.dataset.electrode_coordinates
+        val_dataset.electrode_labels = test_dataset.dataset.electrode_labels
+        test_dataset.electrode_coordinates = test_dataset.dataset.electrode_coordinates
+        test_dataset.electrode_labels = test_dataset.dataset.electrode_labels
 
-    return [
-        {
-            "train_dataset": train_dataset,
-            "val_dataset": val_dataset,
-            "test_dataset": test_dataset
-        }
-    ]
+        datasets.append(
+            {
+                "train_dataset": train_dataset,
+                "val_dataset": val_dataset,
+                "test_dataset": test_dataset
+            }
+        )
+    return datasets
     
 
 def generate_splits_cross_session(test_subject, test_trial_id, eval_name, dtype=torch.float32,
