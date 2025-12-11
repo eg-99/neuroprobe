@@ -30,7 +30,7 @@ parser.add_argument('--eval_name', type=str, default='onset', help='Evaluation n
 parser.add_argument('--subject_id', type=int, required=True, help='Subject ID')
 parser.add_argument('--trial_id', type=int, required=True, help='Trial ID')
 parser.add_argument('--verbose', action='store_true', help='Whether to print progress')
-parser.add_argument('--save_dir', type=str, default='eval_results', help='Directory to save results')
+parser.add_argument('--save_dir', type=str, default='eval_results_single_electrode', help='Directory to save results')
 
 parser.add_argument('--preprocess.type', type=str, default='laplacian-stft_abs', help=f'Preprocessing to apply to neural data ({", ".join(preprocess_options)})')
 parser.add_argument('--preprocess.stft.nperseg', type=int, default=512, help='Length of each segment for FFT calculation (only used if preprocess is stft_absangle, stft_realimag, or stft_abs)')
@@ -150,7 +150,7 @@ for eval_name in eval_names:
             continue
             
         subject.clear_neural_data_cache()
-        subject.set_electrode_subset([electrode_label])
+        # subject.set_electrode_subset([electrode_label])
         subject.load_neural_data(trial_id)
         if verbose:
             log(f"Electrode {electrode_label} subject loaded", priority=0)
@@ -161,13 +161,13 @@ for eval_name in eval_names:
 
         if splits_type == "WithinSession":
             folds = neuroprobe_train_test_splits.generate_splits_within_session(subject, trial_id, eval_name, dtype=torch.float32, 
-                                                                                            output_indices=False, 
+                                                                                            output_indices=False, output_dict=False,
                                                                                             start_neural_data_before_word_onset=int(bins_start_before_word_onset_seconds*neuroprobe_config.SAMPLING_RATE), 
                                                                                             end_neural_data_after_word_onset=int(bins_end_after_word_onset_seconds*neuroprobe_config.SAMPLING_RATE),
                                                                                             lite=lite, max_samples=3500, binary_tasks=binary_tasks)
         elif splits_type == "CrossSession":
             folds = neuroprobe_train_test_splits.generate_splits_cross_session(subject, trial_id, eval_name, dtype=torch.float32, 
-                                                                                            output_indices=False, 
+                                                                                            output_indices=False, output_dict=False,
                                                                                             start_neural_data_before_word_onset=int(bins_start_before_word_onset_seconds*neuroprobe_config.SAMPLING_RATE), 
                                                                                             end_neural_data_after_word_onset=int(bins_end_after_word_onset_seconds*neuroprobe_config.SAMPLING_RATE),
                                                                                             lite=lite, max_samples=3500, include_all_other_trials=True, binary_tasks=binary_tasks)
@@ -188,10 +188,13 @@ for eval_name in eval_names:
                 test_dataset = fold["test_dataset"]
 
                 # Convert PyTorch dataset to numpy arrays for scikit-learn - now using proper preprocess_parameters
-                X_train = np.array([preprocess_data(item[0][:, data_idx_from:data_idx_to].float().numpy(), all_electrode_labels, preprocess_type, preprocess_parameters) for item in train_dataset])
+                X_train = np.array([preprocess_data(item[0][:, data_idx_from:data_idx_to].float().numpy(), subject.electrode_labels, preprocess_type, preprocess_parameters) for item in train_dataset])
                 y_train = np.array([item[1] for item in train_dataset])
-                X_test = np.array([preprocess_data(item[0][:, data_idx_from:data_idx_to].float().numpy(), all_electrode_labels, preprocess_type, preprocess_parameters) for item in test_dataset])
+                X_test = np.array([preprocess_data(item[0][:, data_idx_from:data_idx_to].float().numpy(), subject.electrode_labels, preprocess_type, preprocess_parameters) for item in test_dataset])
                 y_test = np.array([item[1] for item in test_dataset])
+
+                X_train = X_train[:, 0, subject.electrode_labels.index(electrode_label)]
+                X_test = X_test[:, 0, subject.electrode_labels.index(electrode_label)]
 
                 # Flatten the data after preprocessing
                 original_X_train_shape = X_train.shape
