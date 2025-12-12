@@ -30,13 +30,13 @@ splits_options = [
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--eval_name', type=str, default='onset', help='Evaluation name(s) (e.g. onset, gpt2_surprisal). If multiple, separate with commas.')
-parser.add_argument('--split_type', type=str, choices=splits_options, default='WithinSession', help=f'Type of splits to use ({", ".join(splits_options)})')
+parser.add_argument('--split_type', type=str, choices=splits_options, default='CrossSession', help=f'Type of splits to use ({", ".join(splits_options)})')
 parser.add_argument('--subject_id', type=int, required=True, help='Subject ID')
 parser.add_argument('--trial_id', type=int, required=True, help='Trial ID')
 
 parser.add_argument('--verbose', action='store_true', help='Whether to print progress')
 parser.add_argument('--overwrite', action='store_true', help='Whether to overwrite existing results')
-parser.add_argument('--save_dir', type=str, default='eval_results', help='Directory to save results')
+parser.add_argument('--save_dir', type=str, default='data/eval_results', help='Directory to save results')
 parser.add_argument('--seed', type=int, default=42, help='Random seed')
 
 parser.add_argument('--only_1second', action='store_true', help='Whether to only evaluate on 1 second after word onset') # NOTE: set this to true for the Neuroprobe benchmark
@@ -50,6 +50,9 @@ parser.add_argument('--preprocess.stft.poverlap', type=float, default=0.75, help
 parser.add_argument('--preprocess.stft.window', type=str, choices=['hann', 'boxcar'], default='hann', help='Window type for FFT calculation (only used if preprocess is stft_absangle, stft_realimag, or stft_abs)')
 parser.add_argument('--preprocess.stft.max_frequency', type=int, default=150, help='Maximum frequency (Hz) to keep after FFT calculation (only used if preprocess is stft_absangle, stft_realimag, or stft_abs)')
 parser.add_argument('--preprocess.stft.min_frequency', type=int, default=0, help='Minimum frequency (Hz) to keep after FFT calculation (only used if preprocess is stft_absangle, stft_realimag, or stft_abs)')
+
+parser.add_argument('--preprocess.projection.dim', type=int, default=192, help='Dimension of the projection space (only used if preprocess is projection)')
+parser.add_argument('--preprocess.projection.method', type=str, choices=['pca', 'random'], default='pca', help='Method to use for projection (only used if preprocess is projection)')
 
 parser.add_argument('--classifier_type', type=str, choices=['linear', 'cnn', 'transformer', 'mlp'], default='linear', help='Type of classifier to use for evaluation')
 args = parser.parse_args()
@@ -80,6 +83,10 @@ preprocess_parameters = {
         "window": getattr(args, 'preprocess.stft.window'),
         "max_frequency": getattr(args, 'preprocess.stft.max_frequency'),
         "min_frequency": getattr(args, 'preprocess.stft.min_frequency')
+    },
+    "projection": {
+        "dim": getattr(args, 'preprocess.projection.dim'),
+        "method": getattr(args, 'preprocess.projection.method')
     }
 }
 
@@ -126,6 +133,8 @@ for eval_name in eval_names:
     preprocess_suffix += f"_{preprocess_parameters['stft']['window']}" if 'stft' in preprocess_type and preprocess_parameters['stft']['window'] != 'hann' else ''
     preprocess_suffix += f"_maxfreq{preprocess_parameters['stft']['max_frequency']}" if 'stft' in preprocess_type else ''
     preprocess_suffix += f"_minfreq{preprocess_parameters['stft']['min_frequency']}" if 'stft' in preprocess_type and preprocess_parameters['stft']['min_frequency'] != 0 else ''
+
+    preprocess_suffix += f"_projection{preprocess_parameters['projection']['dim']}_{preprocess_parameters['projection']['method']}" if 'projection' in preprocess_type else ''
 
     file_save_dir = f"{save_dir}/{classifier_type}_{preprocess_suffix}"
     os.makedirs(file_save_dir, exist_ok=True) # Create save directory if it doesn't exist
@@ -217,8 +226,21 @@ for eval_name in eval_names:
             # Flatten the data after preprocessing in-place
             original_X_train_shape = X_train.shape
             original_X_test_shape = X_test.shape
-            X_train = X_train.reshape(X_train.shape[0], -1)
-            X_test = X_test.reshape(X_test.shape[0], -1)
+            X_train = X_train.reshape(X_train.shape[0], -1) # N_items, N_features
+            X_test = X_test.reshape(X_test.shape[0], -1) # N_items, N_features
+
+            if 'projection' in preprocess_type:
+                if preprocess_parameters['projection']['method'] == 'pca':
+                    from sklearn.decomposition import PCA
+                    if verbose: log(f"Performing PCA with {preprocess_parameters['projection']['dim']} components...", priority=2, indent=1)
+                    pca = PCA(n_components=preprocess_parameters['projection']['dim'], random_state=seed)
+                    X_train = pca.fit_transform(X_train)
+                    X_test = pca.transform(X_test)
+                elif preprocess_parameters['projection']['method'] == 'random':
+                    if verbose: log(f"Performing random projection with {preprocess_parameters['projection']['dim']} components...", priority=2, indent=1)
+                    random_weights = np.random.randn(X_train.shape[1], preprocess_parameters['projection']['dim'])
+                    X_train = X_train @ random_weights
+                    X_test = X_test @ random_weights
 
             log(f"Standardizing data...", priority=2, indent=1)
 
