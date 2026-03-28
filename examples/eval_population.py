@@ -78,7 +78,15 @@ parser.add_argument('--only_bin_start', type=float, default=None,
 parser.add_argument('--only_bin_end', type=float, default=None,
                     help='If set with --only_bin_start, run evaluation only for this time bin end (seconds, relative to word onset).')
 
-parser.add_argument('--classifier_type', type=str, choices=['linear', 'cnn', 'transformer', 'mlp', 'hybrid', 'gnn', 'dae', 'vae', 'brainbert'], default='linear', help='Type of classifier to use for evaluation')
+parser.add_argument('--classifier_type', type=str, choices=['linear', 'cnn', 'transformer', 'mlp', 'hybrid', 'gnn', 'dae', 'vae', 'brainbert', 'fgat'], default='linear', help='Type of classifier to use for evaluation')
+parser.add_argument('--fgat_D', type=int, default=128, help='FGAT hidden dimension')
+parser.add_argument('--fgat_heads', type=int, default=4, help='FGAT number of attention heads')
+parser.add_argument('--fgat_n_layers', type=int, default=4, help='FGAT number of transformer layers')
+parser.add_argument('--fgat_dropout', type=float, default=0.2, help='FGAT dropout rate')
+parser.add_argument('--fgat_graph_bias', type=lambda x: x.lower() == 'true', default=True, help='FGAT ablation: use graph bias in spatial attention (default True)')
+parser.add_argument('--fgat_graph_type', type=str, choices=['multiband', 'single'], default='multiband', help='FGAT ablation: multiband or single wideband Pearson graph')
+parser.add_argument('--fgat_reref', type=str, choices=['fixed', 'none'], default='fixed', help='FGAT ablation: fixed Laplacian reref or none')
+parser.add_argument('--fgat_pooling', type=str, choices=['gated', 'mean'], default='gated', help='FGAT ablation: gated attention or mean pooling')
 parser.add_argument('--gnn_variant', type=str, default='gnn_v1_stgcn',
                     choices=['gnn_v0_bugfix', 'gnn_v1_stgcn', 'gnn_v2_gat'],
                     help='GNN architecture variant (only used when --classifier_type gnn)')
@@ -396,14 +404,25 @@ for eval_name in eval_names:
                 else:
                     return item[0], item[1]
             
-            X_train = np.concatenate([preprocess_data(get_data_and_label(item)[0][:, data_idx_from:data_idx_to].unsqueeze(0), train_subject.electrode_labels, preprocess_type, preprocess_parameters).float().numpy() for item in train_dataset], axis=0)
+            if classifier_type == 'fgat':
+                # FGAT handles all preprocessing internally — pass raw sliced data
+                X_train = np.concatenate([get_data_and_label(item)[0][:, data_idx_from:data_idx_to].unsqueeze(0).numpy() for item in train_dataset], axis=0)
+                X_test = np.concatenate([get_data_and_label(item)[0][:, data_idx_from:data_idx_to].unsqueeze(0).numpy() for item in test_dataset], axis=0)
+            else:
+                X_train = np.concatenate([preprocess_data(get_data_and_label(item)[0][:, data_idx_from:data_idx_to].unsqueeze(0), train_subject.electrode_labels, preprocess_type, preprocess_parameters).float().numpy() for item in train_dataset], axis=0)
+                X_test = np.concatenate([preprocess_data(get_data_and_label(item)[0][:, data_idx_from:data_idx_to].unsqueeze(0), subject.electrode_labels, preprocess_type, preprocess_parameters).float().numpy() for item in test_dataset], axis=0)
             y_train = np.array([get_data_and_label(item)[1] for item in train_dataset])
-            X_test = np.concatenate([preprocess_data(get_data_and_label(item)[0][:, data_idx_from:data_idx_to].unsqueeze(0), subject.electrode_labels, preprocess_type, preprocess_parameters).float().numpy() for item in test_dataset], axis=0)
             y_test = np.array([get_data_and_label(item)[1] for item in test_dataset])
 
             gc.collect()  # Collect after creating large arrays
 
-            if splits_type == "CrossSubject":
+            if splits_type == "CrossSubject" and classifier_type == 'fgat':
+                raise ValueError(
+                    "FGAT does not support CrossSubject split: electrode sets differ across subjects "
+                    "and combine_regions would destroy the electrode-level graph structure. "
+                    "Use WithinSession or CrossSession with --classifier_type fgat."
+                )
+            if splits_type == "CrossSubject" and classifier_type != 'fgat':
                 if verbose: log("Combining regions...", priority=2, indent=1)
                 regions_train = get_region_labels(train_subject)
                 regions_test = get_region_labels(subject)
@@ -413,6 +432,13 @@ for eval_name in eval_names:
             original_X_train_shape = X_train.shape
             original_X_test_shape = X_test.shape
             
+            # FGAT handles standardization internally — skip for fgat
+            if classifier_type == 'fgat':
+                pass  # raw data passed directly to FGATClassifier
+            elif classifier_type in ['linear', 'mlp']:
+                X_train = X_train.reshape(X_train.shape[0], -1)
+                X_test = X_test.reshape(X_test.shape[0], -1)
+
             # Get electrode coordinates for GNN (before any reshaping)
             electrode_coordinates = None
             if classifier_type == 'gnn':
@@ -425,15 +451,14 @@ for eval_name in eval_names:
                     # Fallback: get from subject
                     electrode_coordinates = train_subject.get_electrode_coordinates().numpy()
             
-            if classifier_type in ['linear', 'mlp']:
-                X_train = X_train.reshape(X_train.shape[0], -1)
-                X_test = X_test.reshape(X_test.shape[0], -1)
             # For cnn, transformer, hybrid, gnn, brainbert: keep original shape
 
             log(f"Standardizing data...", priority=2, indent=1)
 
             # Standardize the data
-            if classifier_type in ['linear', 'mlp']:
+            if classifier_type == 'fgat':
+                pass  # FGAT handles preprocessing (reref, STFT, normalization) internally
+            elif classifier_type in ['linear', 'mlp']:
                 # Standardize flattened data
                 scaler = StandardScaler(copy=False)
                 X_train = scaler.fit_transform(X_train)
@@ -492,6 +517,20 @@ for eval_name in eval_names:
                     frozen=brainbert_frozen
                 )
                 clf.fit(X_train, y_train)
+            elif classifier_type == 'fgat':
+                clf = FGATClassifier(
+                    D=args.fgat_D,
+                    n_heads=args.fgat_heads,
+                    n_layers=args.fgat_n_layers,
+                    dropout=args.fgat_dropout,
+                    use_graph_bias=args.fgat_graph_bias,
+                    graph_type=args.fgat_graph_type,
+                    reref=args.fgat_reref,
+                    pooling=args.fgat_pooling,
+                    random_state=seed,
+                )
+                clf.fit(X_train, y_train,
+                        electrode_labels=train_subject.electrode_labels)
 
             torch.cuda.empty_cache()
             gc.collect()

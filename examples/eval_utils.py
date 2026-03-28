@@ -52,6 +52,8 @@ def model_name_from_classifier_type(classifier_type):
         return "Variational Autoencoder"
     elif classifier_type == 'brainbert':
         return "BrainBERT"
+    elif classifier_type == 'fgat':
+        return "FGAT-NeuroProbe (Frequency-band Graph Attention Transformer)"
     else:
         raise ValueError(f"Invalid classifier type: {classifier_type}")
 
@@ -2717,3 +2719,570 @@ def combine_regions(X_train, X_test, regions_train, regions_test):
         X_test_regions = X_test_regions[:, :, :, 0]
     
     return X_train_regions, X_test_regions, common_regions
+
+
+# ============================================================
+# FGAT-NeuroProbe: Frequency-band Graph Attention Transformer
+# ============================================================
+#
+# Architecture:
+#   raw (B,E,T) → Laplacian reref → STFT log-mag (B,E,TT,F)
+#   → SpectralPatchEncoder → (B,E,TT,D)
+#   → x4 [TemporalTransformerBlock, SpatialGraphAttentionBlock]
+#   → GatedAttentionPool → (B,D) → MLP head → (B,1) logit
+#
+# Spatial attention is biased by a learned weighted sum of
+# band-specific (theta/alpha/beta/low-gamma/high-gamma)
+# functional connectivity matrices built from training data.
+
+from torch.utils.data import DataLoader, TensorDataset
+import torch.nn.functional as _F_func
+
+# Frequency bands (name, lo_hz, hi_hz) — used by MultibandGraphBuilder
+FGAT_FREQ_BANDS = [
+    ('theta',      4,   8),
+    ('alpha',      8,  13),
+    ('beta',       13, 30),
+    ('low_gamma',  30, 70),
+    ('high_gamma', 70, 150),
+]
+
+
+class MultibandGraphBuilder:
+    """Builds a static multiband functional connectivity graph from training STFT features.
+
+    fit(stft_mag) takes (N, E, TT, F) log-magnitude spectrogram (training set only)
+    and returns A_static: torch.FloatTensor of shape (n_bands, E, E).
+    """
+
+    def __init__(self, k_neighbors=8, sampling_rate=2048, nperseg=512,
+                 min_freq=0, max_freq=150):
+        self.k_neighbors = k_neighbors
+        self.sampling_rate = sampling_rate
+        self.nperseg = nperseg
+        self.min_freq = min_freq
+        self.max_freq = max_freq
+
+    def _freq_axis(self, F):
+        """Return frequency axis for F bins (matches preprocess_stft filtering)."""
+        freqs_full = np.fft.rfftfreq(self.nperseg, d=1.0 / self.sampling_rate)
+        mask = (freqs_full >= self.min_freq) & (freqs_full <= self.max_freq)
+        freq_axis = freqs_full[mask]
+        if len(freq_axis) != F:
+            # Fallback if parameter mismatch
+            freq_axis = np.linspace(self.min_freq, self.max_freq, F)
+        return freq_axis
+
+    def fit(self, stft_mag, bands=None):
+        """
+        Args:
+            stft_mag: (N, E, TT, F) numpy array, log-magnitude spectrogram
+            bands: list of (name, lo_hz, hi_hz) tuples, defaults to FGAT_FREQ_BANDS
+        Returns:
+            A_static: torch.FloatTensor of shape (n_bands, E, E)
+        """
+        if isinstance(stft_mag, torch.Tensor):
+            stft_mag = stft_mag.numpy()
+        if bands is None:
+            bands = FGAT_FREQ_BANDS
+
+        N, E, TT, F = stft_mag.shape
+        freq_axis = self._freq_axis(F)
+
+        band_matrices = []
+        for name, lo, hi in bands:
+            band_mask = (freq_axis >= lo) & (freq_axis < hi)
+            if band_mask.sum() == 0:
+                band_matrices.append(self._uniform_knn(E))
+                continue
+
+            # Average over freq bins in band → (N, E, TT) → mean over time → (N, E)
+            band_env = stft_mag[:, :, :, band_mask].mean(axis=3).mean(axis=2)
+
+            if N < 2:
+                band_matrices.append(self._uniform_knn(E))
+                continue
+
+            # Pearson correlation: np.corrcoef expects (variables, observations) = (E, N)
+            corr = np.corrcoef(band_env.T)  # (E, E)
+            corr = np.nan_to_num(corr, nan=0.0)
+            np.fill_diagonal(corr, 0.0)
+            band_matrices.append(self._sparsify(corr, E))
+
+        A_static = np.stack(band_matrices, axis=0)  # (n_bands, E, E)
+        return torch.FloatTensor(A_static)
+
+    def fit_single(self, stft_mag):
+        """Build a single wideband Pearson graph. Returns (1, E, E)."""
+        if isinstance(stft_mag, torch.Tensor):
+            stft_mag = stft_mag.numpy()
+        N, E, TT, F = stft_mag.shape
+        band_env = stft_mag.mean(axis=3).mean(axis=2)  # (N, E) — all freqs, all times
+        if N < 2:
+            return torch.FloatTensor(self._uniform_knn(E)).unsqueeze(0)
+        corr = np.corrcoef(band_env.T)
+        corr = np.nan_to_num(corr, nan=0.0)
+        np.fill_diagonal(corr, 0.0)
+        A = self._sparsify(corr, E)
+        return torch.FloatTensor(A).unsqueeze(0)  # (1, E, E)
+
+    def _sparsify(self, corr, E):
+        """Keep top-k neighbors per row, symmetrize, clip negatives."""
+        k = min(self.k_neighbors, E - 1)
+        A = np.zeros_like(corr)
+        for i in range(E):
+            top_k = np.argsort(corr[i])[::-1][:k]
+            A[i, top_k] = corr[i, top_k]
+        A = np.maximum(A, A.T)
+        return np.clip(A, 0, None).astype(np.float32)
+
+    def _uniform_knn(self, E):
+        """Fallback: uniform local kNN graph when Pearson is undefined."""
+        k = min(self.k_neighbors, E - 1)
+        A = np.zeros((E, E), dtype=np.float32)
+        for i in range(E):
+            lo, hi = max(0, i - k // 2), min(E, i + k // 2 + 1)
+            neighbors = [j for j in range(lo, hi) if j != i][:k]
+            A[i, neighbors] = 1.0
+        return np.maximum(A, A.T)
+
+
+class GraphBiasBuilder(torch.nn.Module):
+    """Learned weighted combination of band adjacency matrices per attention head.
+
+    alpha: (n_heads, n_bands) — learned, softmax over band dimension.
+    forward(A_static: (M, E, E)) -> bias: (H, E, E)
+    """
+
+    def __init__(self, n_heads, n_bands=5):
+        super().__init__()
+        self.alpha = torch.nn.Parameter(torch.zeros(n_heads, n_bands))
+
+    def forward(self, A_static):
+        # A_static: (M, E, E)
+        alpha_w = _F_func.softmax(self.alpha, dim=1)       # (H, M) convex combination
+        return torch.einsum('hm,mij->hij', alpha_w, A_static)  # (H, E, E)
+
+
+class SpectralPatchEncoder(torch.nn.Module):
+    """Shared MLP: maps each (electrode, time_bin) frequency vector F → D.
+
+    Input:  (B, E, TT, F)
+    Output: (B, E, TT, D)
+    """
+
+    def __init__(self, F, D, dropout=0.1):
+        super().__init__()
+        self.D = D
+        self.net = torch.nn.Sequential(
+            torch.nn.LayerNorm(F),
+            torch.nn.Linear(F, D),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(D, D),
+        )
+
+    def forward(self, x):
+        B, E, TT, F = x.shape
+        return self.net(x.reshape(B * E * TT, F)).reshape(B, E, TT, self.D)
+
+
+class TemporalTransformerBlock(torch.nn.Module):
+    """Standard MHA over the TT time axis within each electrode.
+
+    Input/output: (B, E, TT, D)
+    Internally reshapes to (B*E, TT, D) for nn.MultiheadAttention.
+    """
+
+    def __init__(self, D, n_heads, dropout=0.1):
+        super().__init__()
+        self.norm1 = torch.nn.LayerNorm(D)
+        self.attn = torch.nn.MultiheadAttention(D, n_heads, dropout=dropout, batch_first=True)
+        self.norm2 = torch.nn.LayerNorm(D)
+        self.ffn = torch.nn.Sequential(
+            torch.nn.Linear(D, 4 * D),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(4 * D, D),
+        )
+        self.drop = torch.nn.Dropout(dropout)
+
+    def forward(self, z):
+        B, E, TT, D = z.shape
+        z_flat = z.reshape(B * E, TT, D)
+        normed = self.norm1(z_flat)
+        attn_out, _ = self.attn(normed, normed, normed)
+        z_flat = z_flat + self.drop(attn_out)
+        z_flat = z_flat + self.drop(self.ffn(self.norm2(z_flat)))
+        return z_flat.reshape(B, E, TT, D)
+
+
+class SpatialGraphAttentionBlock(torch.nn.Module):
+    """Custom MHA over E electrodes per time bin, with additive graph bias.
+
+    Input/output: (B, E, TT, D)
+    graph_bias: (H, E, E) — added to scaled QK logits before softmax.
+
+    Reshape order: (B,E,TT,D) → permute(0,2,1,3) → (B,TT,E,D) → reshape(B*TT,E,D).
+    IMPORTANT: permute before reshape to avoid interleaving batch and electrode dims.
+    """
+
+    def __init__(self, D, n_heads, dropout=0.1):
+        super().__init__()
+        assert D % n_heads == 0, f"D={D} must be divisible by n_heads={n_heads}"
+        self.D = D
+        self.n_heads = n_heads
+        self.d_h = D // n_heads
+        self.scale = self.d_h ** -0.5
+
+        self.norm1 = torch.nn.LayerNorm(D)
+        self.q_proj = torch.nn.Linear(D, D)
+        self.k_proj = torch.nn.Linear(D, D)
+        self.v_proj = torch.nn.Linear(D, D)
+        self.out_proj = torch.nn.Linear(D, D)
+        self.norm2 = torch.nn.LayerNorm(D)
+        self.ffn = torch.nn.Sequential(
+            torch.nn.Linear(D, 4 * D),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(4 * D, D),
+        )
+        self.drop = torch.nn.Dropout(dropout)
+
+    def forward(self, z, graph_bias):
+        # z: (B, E, TT, D),  graph_bias: (H, E, E)
+        B, E, TT, D = z.shape
+        H, d_h = self.n_heads, self.d_h
+
+        # Permute then reshape — order matters!
+        z_perm = z.permute(0, 2, 1, 3)           # (B, TT, E, D)
+        z_flat = z_perm.reshape(B * TT, E, D)     # (B*TT, E, D)
+
+        normed = self.norm1(z_flat)
+        Q = self.q_proj(normed).reshape(B * TT, E, H, d_h).permute(0, 2, 1, 3)  # (B*TT,H,E,d_h)
+        K = self.k_proj(normed).reshape(B * TT, E, H, d_h).permute(0, 2, 1, 3)
+        V = self.v_proj(normed).reshape(B * TT, E, H, d_h).permute(0, 2, 1, 3)
+
+        scores = torch.matmul(Q, K.transpose(-1, -2)) * self.scale  # (B*TT, H, E, E)
+        scores = scores + graph_bias.unsqueeze(0)                    # broadcast batch dim
+        attn = _F_func.softmax(scores, dim=-1)
+        attn = self.drop(attn)
+
+        out = torch.matmul(attn, V)                                  # (B*TT, H, E, d_h)
+        out = out.permute(0, 2, 1, 3).reshape(B * TT, E, D)
+        out = self.out_proj(out)
+
+        z_flat = z_flat + self.drop(out)
+        z_flat = z_flat + self.drop(self.ffn(self.norm2(z_flat)))
+
+        # Inverse: (B*TT,E,D) → (B,TT,E,D) → permute → (B,E,TT,D)
+        return z_flat.reshape(B, TT, E, D).permute(0, 2, 1, 3).contiguous()
+
+
+class GatedAttentionPool(torch.nn.Module):
+    """Gated attention pooling over token dimension.
+
+    Input:  (B, N, D)
+    Output: (B, D)
+    """
+
+    def __init__(self, D):
+        super().__init__()
+        self.W = torch.nn.Linear(D, D)
+        self.w = torch.nn.Linear(D, 1, bias=False)
+
+    def forward(self, h):
+        gates = self.w(torch.tanh(self.W(h)))               # (B, N, 1)
+        alpha = _F_func.softmax(gates, dim=1)               # (B, N, 1)
+        return (alpha * h).sum(dim=1)                        # (B, D)
+
+
+class FGATModel(torch.nn.Module):
+    """Full FGAT-NeuroProbe model.
+
+    Input:  x_stft (B, E, TT, F) — log-magnitude spectrogram
+    Output: logit  (B, 1)
+
+    Ablation flags:
+        use_graph_bias: inject graph bias in spatial attention (default True)
+        pooling: 'gated' (default) or 'mean'
+    """
+
+    def __init__(self, E, F, TT, D=128, n_heads=4, n_layers=4, dropout=0.2,
+                 n_bands=5, use_graph_bias=True, pooling='gated'):
+        super().__init__()
+        self.E = E
+        self.D = D
+        self.n_heads = n_heads
+        self.use_graph_bias = use_graph_bias
+        self.pooling_type = pooling
+
+        self.encoder = SpectralPatchEncoder(F, D, dropout=dropout)
+        self.electrode_embed = torch.nn.Embedding(E, D)
+        self.time_embed = torch.nn.Embedding(TT, D)
+
+        self.temporal_blocks = torch.nn.ModuleList([
+            TemporalTransformerBlock(D, n_heads, dropout) for _ in range(n_layers)
+        ])
+        self.spatial_blocks = torch.nn.ModuleList([
+            SpatialGraphAttentionBlock(D, n_heads, dropout) for _ in range(n_layers)
+        ])
+
+        if use_graph_bias:
+            self.graph_bias_builder = GraphBiasBuilder(n_heads, n_bands)
+
+        if pooling == 'gated':
+            self.pool = GatedAttentionPool(D)
+
+        self.head = torch.nn.Sequential(
+            torch.nn.LayerNorm(D),
+            torch.nn.Linear(D, D // 2),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(D // 2, 1),
+        )
+
+    def set_graph(self, A_static):
+        """Register A_static as a non-parameter buffer. Shape: (n_bands, E, E)."""
+        self.register_buffer('A_static', A_static)
+
+    def forward(self, x_stft):
+        # x_stft: (B, E, TT, F)
+        B, E, TT, _ = x_stft.shape
+        device = x_stft.device
+
+        # Compute graph bias once per batch
+        if self.use_graph_bias and hasattr(self, 'A_static'):
+            graph_bias = self.graph_bias_builder(self.A_static)    # (H, E, E)
+        else:
+            graph_bias = torch.zeros(self.n_heads, E, E, device=device)
+
+        # Spectral encoding
+        z = self.encoder(x_stft)                                   # (B, E, TT, D)
+
+        # Add positional embeddings
+        e_idx = torch.arange(E, device=device)
+        t_idx = torch.arange(TT, device=device)
+        z = z + self.electrode_embed(e_idx).unsqueeze(0).unsqueeze(2)  # (1,E,1,D)
+        z = z + self.time_embed(t_idx).unsqueeze(0).unsqueeze(1)       # (1,1,TT,D)
+
+        # Alternating temporal / spatial transformer blocks
+        for t_block, s_block in zip(self.temporal_blocks, self.spatial_blocks):
+            z = t_block(z)
+            z = s_block(z, graph_bias)
+
+        # Flatten → pool → classify
+        h = z.reshape(B, E * TT, self.D)
+        p = self.pool(h) if self.pooling_type == 'gated' else h.mean(dim=1)
+        return self.head(p)   # (B, 1)
+
+
+class FGATClassifier:
+    """Sklearn-style wrapper for FGATModel.
+
+    Handles Laplacian rereferencing, STFT featurization, multiband graph
+    construction, and the training loop internally.
+
+    fit() and predict_proba() receive raw neural data (N, E, T).
+
+    Ablation flags:
+        use_graph_bias (bool): inject graph bias into spatial attention [default True]
+        graph_type ('multiband'|'single'): multiband or single wideband Pearson graph
+        reref ('fixed'|'none'): apply Laplacian reref or pass raw data through
+        pooling ('gated'|'mean'): gated attention pooling or mean pooling
+    """
+
+    def __init__(self, D=128, n_heads=4, n_layers=4, dropout=0.2,
+                 lr=1e-4, weight_decay=1e-2, max_iter=200, patience=25,
+                 batch_size=32, val_size=0.1, random_state=42,
+                 use_graph_bias=True, graph_type='multiband',
+                 reref='fixed', pooling='gated'):
+        self.D = D
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.dropout = dropout
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.max_iter = max_iter
+        self.patience = patience
+        self.batch_size = batch_size
+        self.val_size = val_size
+        self.random_state = random_state
+        self.use_graph_bias = use_graph_bias
+        self.graph_type = graph_type
+        self.reref = reref
+        self.pooling = pooling
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = None
+        self.classes_ = None
+        self.electrode_labels_ = None
+        # STFT params — match preprocess_stft defaults
+        self._stft_params = {
+            'stft': {'nperseg': 512, 'poverlap': 0.75, 'window': 'hann',
+                     'max_frequency': 150, 'min_frequency': 0}
+        }
+
+    def _preprocess(self, X_raw, electrode_labels=None):
+        """Laplacian reref + STFT + log1p. Returns (N, E, TT, F) float32 numpy."""
+        # Step 1: Laplacian rereferencing
+        if self.reref == 'fixed' and electrode_labels is not None:
+            try:
+                X_ref, _ = laplacian_rereference_neural_data(X_raw, electrode_labels)
+                if isinstance(X_ref, torch.Tensor):
+                    X_ref = X_ref.numpy()
+            except Exception:
+                X_ref = X_raw if isinstance(X_raw, np.ndarray) else X_raw.numpy()
+        else:
+            X_ref = X_raw if isinstance(X_raw, np.ndarray) else X_raw.numpy()
+
+        # Step 2: STFT magnitude
+        stft_out = preprocess_stft(
+            X_ref,
+            sampling_rate=neuroprobe_config.SAMPLING_RATE,
+            preprocess='stft_abs',
+            preprocess_parameters=self._stft_params,
+        )
+        if isinstance(stft_out, torch.Tensor):
+            stft_out = stft_out.numpy()
+
+        # Step 3: log(1 + |STFT|)
+        return np.log1p(stft_out).astype(np.float32)
+
+    def fit(self, X_raw, y, electrode_labels=None, electrode_coordinates=None):
+        """
+        Args:
+            X_raw: (N, E, T) numpy array — raw neural signal
+            y:     (N,) numpy array — binary labels (0/1)
+            electrode_labels: list of electrode label strings (for Laplacian reref)
+        """
+        np.random.seed(self.random_state)
+        torch.manual_seed(self.random_state)
+
+        self.classes_ = np.unique(y)
+        self.electrode_labels_ = electrode_labels
+
+        # Preprocess
+        stft_log = self._preprocess(X_raw, electrode_labels)  # (N, E, TT, F)
+        N, E, TT, F_bins = stft_log.shape
+
+        # Fixed train/val split (matching GNNClassifier: last val_size fraction)
+        val_n = max(20, int(self.val_size * N))
+        val_n = min(val_n, N // 4)
+        train_n = N - val_n
+        X_tr, y_tr = stft_log[:train_n], y[:train_n]
+        X_val, y_val = stft_log[train_n:], y[train_n:]
+
+        log(f"FGAT fit: N={N} E={E} TT={TT} F={F_bins} train={train_n} val={val_n} device={self.device}",
+            priority=3, indent=2)
+
+        # Build static functional graph from training data only
+        n_bands = len(FGAT_FREQ_BANDS) if self.graph_type == 'multiband' else 1
+        if self.use_graph_bias:
+            builder = MultibandGraphBuilder(
+                k_neighbors=8,
+                sampling_rate=neuroprobe_config.SAMPLING_RATE,
+                nperseg=self._stft_params['stft']['nperseg'],
+                min_freq=self._stft_params['stft']['min_frequency'],
+                max_freq=self._stft_params['stft']['max_frequency'],
+            )
+            if self.graph_type == 'single':
+                A_static = builder.fit_single(X_tr)  # (1, E, E)
+            else:
+                A_static = builder.fit(X_tr)          # (5, E, E)
+            A_static = A_static.to(self.device)
+        else:
+            A_static = None
+
+        # Instantiate model
+        self.model = FGATModel(
+            E=E, F=F_bins, TT=TT, D=self.D,
+            n_heads=self.n_heads, n_layers=self.n_layers,
+            dropout=self.dropout, n_bands=n_bands,
+            use_graph_bias=self.use_graph_bias,
+            pooling=self.pooling,
+        ).to(self.device)
+
+        if A_static is not None:
+            self.model.set_graph(A_static)
+
+        # Class-weighted BCE loss
+        n_pos = max(int((y_tr == 1).sum()), 1)
+        n_neg = max(int((y_tr == 0).sum()), 1)
+        pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float32, device=self.device)
+        criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
+        )
+
+        # DataLoaders
+        train_loader = DataLoader(
+            TensorDataset(torch.FloatTensor(X_tr), torch.FloatTensor(y_tr.astype(np.float32))),
+            batch_size=self.batch_size, shuffle=True, drop_last=False,
+        )
+        X_val_t = torch.FloatTensor(X_val).to(self.device)
+        y_val_np = y_val.astype(np.float32)
+
+        best_val_auroc = 0.0
+        best_state = None
+        patience_counter = 0
+
+        for epoch in range(self.max_iter):
+            self.model.train()
+            for batch_X, batch_y in train_loader:
+                batch_X, batch_y = batch_X.to(self.device), batch_y.to(self.device)
+                optimizer.zero_grad()
+                logit = self.model(batch_X).squeeze(1)
+                loss = criterion(logit, batch_y)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+
+            # Validation AUROC
+            self.model.eval()
+            with torch.no_grad():
+                val_logits = self.model(X_val_t).squeeze(1).cpu().numpy()
+            val_probs = 1.0 / (1.0 + np.exp(-val_logits))
+            try:
+                val_auroc = roc_auc_score(y_val_np, val_probs)
+            except Exception:
+                val_auroc = 0.5
+
+            if val_auroc > best_val_auroc:
+                best_val_auroc = val_auroc
+                best_state = {k: v.cpu().clone() for k, v in self.model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    log(f"FGAT early stop epoch={epoch+1} best_auroc={best_val_auroc:.4f}",
+                        priority=3, indent=2)
+                    break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+        log(f"FGAT training done. best_val_auroc={best_val_auroc:.4f}", priority=3, indent=2)
+        return self
+
+    def predict_proba(self, X_raw):
+        """Returns (N, 2) array: col0 = 1-p, col1 = p."""
+        stft_log = self._preprocess(X_raw, self.electrode_labels_)
+        X_t = torch.FloatTensor(stft_log)
+
+        self.model.eval()
+        probs_list = []
+        with torch.no_grad():
+            for i in range(0, len(X_t), self.batch_size):
+                batch = X_t[i:i + self.batch_size].to(self.device)
+                logits = self.model(batch).squeeze(1).cpu().numpy()
+                probs_list.append(1.0 / (1.0 + np.exp(-logits)))
+
+        p = np.concatenate(probs_list, axis=0)
+        return np.column_stack([1.0 - p, p])
+
+    def score(self, X_raw, y):
+        """Returns accuracy (threshold at 0.5)."""
+        proba = self.predict_proba(X_raw)
+        preds = (proba[:, 1] >= 0.5).astype(int)
+        return float((preds == y.astype(int)).mean())
