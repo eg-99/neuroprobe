@@ -3092,8 +3092,8 @@ class FGATClassifier:
         pooling ('gated'|'mean'): gated attention pooling or mean pooling
     """
 
-    def __init__(self, D=128, n_heads=4, n_layers=4, dropout=0.2,
-                 lr=1e-4, weight_decay=1e-2, max_iter=200, patience=25,
+    def __init__(self, D=64, n_heads=4, n_layers=2, dropout=0.3,
+                 lr=1e-4, weight_decay=1e-2, max_iter=100, patience=20,
                  batch_size=32, val_size=0.1, random_state=42,
                  use_graph_bias=True, graph_type='multiband',
                  reref='fixed', pooling='gated'):

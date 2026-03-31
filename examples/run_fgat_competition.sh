@@ -23,10 +23,10 @@ set -e
 # ---------------------------------------------------------------------------
 # Configuration — tune these for ablations
 # ---------------------------------------------------------------------------
-FGAT_D="${FGAT_D:-128}"
+FGAT_D="${FGAT_D:-64}"
 FGAT_HEADS="${FGAT_HEADS:-4}"
-FGAT_N_LAYERS="${FGAT_N_LAYERS:-4}"
-FGAT_DROPOUT="${FGAT_DROPOUT:-0.2}"
+FGAT_N_LAYERS="${FGAT_N_LAYERS:-2}"
+FGAT_DROPOUT="${FGAT_DROPOUT:-0.3}"
 FGAT_GRAPH_BIAS="${FGAT_GRAPH_BIAS:-true}"
 FGAT_GRAPH_TYPE="${FGAT_GRAPH_TYPE:-multiband}"
 FGAT_REREF="${FGAT_REREF:-fixed}"

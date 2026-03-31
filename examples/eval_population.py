@@ -79,10 +79,10 @@ parser.add_argument('--only_bin_end', type=float, default=None,
                     help='If set with --only_bin_start, run evaluation only for this time bin end (seconds, relative to word onset).')
 
 parser.add_argument('--classifier_type', type=str, choices=['linear', 'cnn', 'transformer', 'mlp', 'hybrid', 'gnn', 'dae', 'vae', 'brainbert', 'fgat'], default='linear', help='Type of classifier to use for evaluation')
-parser.add_argument('--fgat_D', type=int, default=128, help='FGAT hidden dimension')
+parser.add_argument('--fgat_D', type=int, default=64, help='FGAT hidden dimension')
 parser.add_argument('--fgat_heads', type=int, default=4, help='FGAT number of attention heads')
-parser.add_argument('--fgat_n_layers', type=int, default=4, help='FGAT number of transformer layers')
-parser.add_argument('--fgat_dropout', type=float, default=0.2, help='FGAT dropout rate')
+parser.add_argument('--fgat_n_layers', type=int, default=2, help='FGAT number of transformer layers')
+parser.add_argument('--fgat_dropout', type=float, default=0.3, help='FGAT dropout rate')
 parser.add_argument('--fgat_graph_bias', type=lambda x: x.lower() == 'true', default=True, help='FGAT ablation: use graph bias in spatial attention (default True)')
 parser.add_argument('--fgat_graph_type', type=str, choices=['multiband', 'single'], default='multiband', help='FGAT ablation: multiband or single wideband Pearson graph')
 parser.add_argument('--fgat_reref', type=str, choices=['fixed', 'none'], default='fixed', help='FGAT ablation: fixed Laplacian reref or none')
