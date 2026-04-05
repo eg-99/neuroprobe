@@ -88,6 +88,8 @@ parser.add_argument('--fgat_graph_bias', type=lambda x: x.lower() == 'true', def
 parser.add_argument('--fgat_graph_type', type=str, choices=['multiband', 'single'], default='multiband', help='FGAT ablation: multiband or single wideband Pearson graph')
 parser.add_argument('--fgat_reref', type=str, choices=['fixed', 'none'], default='fixed', help='FGAT ablation: fixed Laplacian reref or none')
 parser.add_argument('--fgat_pooling', type=str, choices=['gated', 'mean'], default='gated', help='FGAT ablation: gated attention or mean pooling')
+parser.add_argument('--fgat_max_iter', type=int, default=150, help='FGAT max training epochs')
+parser.add_argument('--fgat_patience', type=int, default=20, help='FGAT early stopping patience')
 parser.add_argument('--gnn_variant', type=str, default='gnn_v1_stgcn',
                     choices=['gnn_v0_bugfix', 'gnn_v1_stgcn', 'gnn_v2_gat'],
                     help='GNN architecture variant (only used when --classifier_type gnn)')
@@ -525,6 +527,8 @@ for eval_name in eval_names:
                     n_layers=args.fgat_n_layers,
                     dropout=args.fgat_dropout,
                     weight_decay=args.fgat_weight_decay,
+                    max_iter=args.fgat_max_iter,
+                    patience=args.fgat_patience,
                     use_graph_bias=args.fgat_graph_bias,
                     graph_type=args.fgat_graph_type,
                     reref=args.fgat_reref,
