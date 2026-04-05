@@ -3092,8 +3092,8 @@ class FGATClassifier:
         pooling ('gated'|'mean'): gated attention pooling or mean pooling
     """
 
-    def __init__(self, D=64, n_heads=4, n_layers=2, dropout=0.3,
-                 lr=1e-4, weight_decay=1e-2, max_iter=100, patience=20,
+    def __init__(self, D=96, n_heads=4, n_layers=2, dropout=0.1,
+                 lr=1e-4, weight_decay=1e-3, max_iter=150, patience=20,
                  batch_size=32, val_size=0.1, random_state=42,
                  use_graph_bias=True, graph_type='multiband',
                  reref='fixed', pooling='gated'):
@@ -3117,6 +3117,7 @@ class FGATClassifier:
         self.model = None
         self.classes_ = None
         self.electrode_labels_ = None
+        self._scaler = None
         # STFT params — match preprocess_stft defaults
         self._stft_params = {
             'stft': {'nperseg': 512, 'poverlap': 0.75, 'window': 'hann',
@@ -3162,18 +3163,36 @@ class FGATClassifier:
         self.classes_ = np.unique(y)
         self.electrode_labels_ = electrode_labels
 
-        # Preprocess
+        # Preprocess: Laplacian reref + STFT + log1p
         stft_log = self._preprocess(X_raw, electrode_labels)  # (N, E, TT, F)
         N, E, TT, F_bins = stft_log.shape
 
-        # Fixed train/val split (matching GNNClassifier: last val_size fraction)
+        # Stratified val split — same distribution as train, avoids temporal ordering bias
+        from sklearn.model_selection import StratifiedShuffleSplit
         val_n = max(20, int(self.val_size * N))
         val_n = min(val_n, N // 4)
-        train_n = N - val_n
-        X_tr, y_tr = stft_log[:train_n], y[:train_n]
-        X_val, y_val = stft_log[train_n:], y[train_n:]
+        try:
+            sss = StratifiedShuffleSplit(n_splits=1, test_size=val_n,
+                                        random_state=self.random_state)
+            train_idx, val_idx = next(sss.split(stft_log, y))
+        except ValueError:
+            # Fallback if a class has too few samples for stratification
+            train_n = N - val_n
+            train_idx = np.arange(train_n)
+            val_idx = np.arange(train_n, N)
 
-        log(f"FGAT fit: N={N} E={E} TT={TT} F={F_bins} train={train_n} val={val_n} device={self.device}",
+        X_tr, y_tr = stft_log[train_idx], y[train_idx]
+        X_val, y_val = stft_log[val_idx], y[val_idx]
+
+        # Z-score normalization fitted on training data only — matches StandardScaler
+        # used by other classifiers, ensures consistent input scale for the transformer
+        from sklearn.preprocessing import StandardScaler
+        orig_shape = X_tr.shape
+        self._scaler = StandardScaler()
+        X_tr  = self._scaler.fit_transform(X_tr.reshape(len(X_tr), -1)).reshape(orig_shape).astype(np.float32)
+        X_val = self._scaler.transform(X_val.reshape(len(X_val), -1)).reshape(X_val.shape).astype(np.float32)
+
+        log(f"FGAT fit: N={N} E={E} TT={TT} F={F_bins} train={len(X_tr)} val={len(X_val)} device={self.device}",
             priority=3, indent=2)
 
         # Build static functional graph from training data only
@@ -3268,6 +3287,10 @@ class FGATClassifier:
     def predict_proba(self, X_raw):
         """Returns (N, 2) array: col0 = 1-p, col1 = p."""
         stft_log = self._preprocess(X_raw, self.electrode_labels_)
+        if self._scaler is not None:
+            stft_log = self._scaler.transform(
+                stft_log.reshape(len(stft_log), -1)
+            ).reshape(stft_log.shape).astype(np.float32)
         X_t = torch.FloatTensor(stft_log)
 
         self.model.eval()
