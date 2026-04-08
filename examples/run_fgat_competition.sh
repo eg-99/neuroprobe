@@ -21,17 +21,20 @@
 set -e
 
 # ---------------------------------------------------------------------------
-# Configuration — tune these for ablations
+# Configuration — fgat_large (best from benchmark_v2, April 2026)
 # ---------------------------------------------------------------------------
-FGAT_D="${FGAT_D:-64}"
+FGAT_D="${FGAT_D:-128}"
 FGAT_HEADS="${FGAT_HEADS:-4}"
-FGAT_N_LAYERS="${FGAT_N_LAYERS:-2}"
-FGAT_DROPOUT="${FGAT_DROPOUT:-0.3}"
+FGAT_N_LAYERS="${FGAT_N_LAYERS:-3}"
+FGAT_DROPOUT="${FGAT_DROPOUT:-0.1}"
+FGAT_WEIGHT_DECAY="${FGAT_WEIGHT_DECAY:-1e-3}"
+FGAT_MAX_ITER="${FGAT_MAX_ITER:-150}"
+FGAT_PATIENCE="${FGAT_PATIENCE:-20}"
 FGAT_GRAPH_BIAS="${FGAT_GRAPH_BIAS:-true}"
 FGAT_GRAPH_TYPE="${FGAT_GRAPH_TYPE:-multiband}"
 FGAT_REREF="${FGAT_REREF:-fixed}"
 FGAT_POOLING="${FGAT_POOLING:-gated}"
-SAVE_BASE="${SAVE_BASE:-eval_results/fgat_competition}"
+SAVE_BASE="${SAVE_BASE:-eval_results/fgat_competition_large}"
 
 # Data root — override via env var or edit here
 export ROOT_DIR_BRAINTREEBANK="${ROOT_DIR_BRAINTREEBANK:-/storage/eg99/braintreebank_data}"
@@ -70,6 +73,9 @@ run_eval() {
         --fgat_heads "$FGAT_HEADS" \
         --fgat_n_layers "$FGAT_N_LAYERS" \
         --fgat_dropout "$FGAT_DROPOUT" \
+        --fgat_weight_decay "$FGAT_WEIGHT_DECAY" \
+        --fgat_max_iter "$FGAT_MAX_ITER" \
+        --fgat_patience "$FGAT_PATIENCE" \
         --fgat_graph_bias "$FGAT_GRAPH_BIAS" \
         --fgat_graph_type "$FGAT_GRAPH_TYPE" \
         --fgat_reref "$FGAT_REREF" \
@@ -88,6 +94,7 @@ run_eval() {
 echo "========================================================"
 echo "FGAT-NeuroProbe Competition Run"
 echo "  D=$FGAT_D  heads=$FGAT_HEADS  layers=$FGAT_N_LAYERS"
+echo "  dropout=$FGAT_DROPOUT  wd=$FGAT_WEIGHT_DECAY  max_iter=$FGAT_MAX_ITER  patience=$FGAT_PATIENCE"
 echo "  graph_bias=$FGAT_GRAPH_BIAS  graph_type=$FGAT_GRAPH_TYPE"
 echo "  reref=$FGAT_REREF  pooling=$FGAT_POOLING"
 echo "  Data   : $ROOT_DIR_BRAINTREEBANK"
