@@ -408,14 +408,25 @@ for eval_name in eval_names:
                     return item[0], item[1]
             
             if classifier_type == 'fgat':
-                # FGAT handles all preprocessing internally — pass raw sliced data
-                X_train = np.concatenate([get_data_and_label(item)[0][:, data_idx_from:data_idx_to].unsqueeze(0).numpy() for item in train_dataset], axis=0)
-                X_test = np.concatenate([get_data_and_label(item)[0][:, data_idx_from:data_idx_to].unsqueeze(0).numpy() for item in test_dataset], axis=0)
+                # FGAT handles all preprocessing internally — pass raw sliced data.
+                # Filter items whose time window is empty (words near end of trial).
+                def _fgat_items(dataset):
+                    xs, ys = [], []
+                    for item in dataset:
+                        x, y_item = get_data_and_label(item)
+                        sliced = x[:, data_idx_from:data_idx_to]
+                        if sliced.shape[-1] == 0:
+                            continue
+                        xs.append(sliced.unsqueeze(0).numpy())
+                        ys.append(y_item)
+                    return np.concatenate(xs, axis=0), np.array(ys)
+                X_train, y_train = _fgat_items(train_dataset)
+                X_test,  y_test  = _fgat_items(test_dataset)
             else:
                 X_train = np.concatenate([preprocess_data(get_data_and_label(item)[0][:, data_idx_from:data_idx_to].unsqueeze(0), train_subject.electrode_labels, preprocess_type, preprocess_parameters).float().numpy() for item in train_dataset], axis=0)
                 X_test = np.concatenate([preprocess_data(get_data_and_label(item)[0][:, data_idx_from:data_idx_to].unsqueeze(0), subject.electrode_labels, preprocess_type, preprocess_parameters).float().numpy() for item in test_dataset], axis=0)
-            y_train = np.array([get_data_and_label(item)[1] for item in train_dataset])
-            y_test = np.array([get_data_and_label(item)[1] for item in test_dataset])
+                y_train = np.array([get_data_and_label(item)[1] for item in train_dataset])
+                y_test = np.array([get_data_and_label(item)[1] for item in test_dataset])
 
             gc.collect()  # Collect after creating large arrays
 
