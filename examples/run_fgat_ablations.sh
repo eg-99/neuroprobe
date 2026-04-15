@@ -30,6 +30,7 @@ export NEUROPROBE_FEATURES_FILE="${NEUROPROBE_FEATURES_FILE:-features.csv}"
 TASKS="onset,speech,volume,gpt2_surprisal,word_length"
 SPLIT="WithinSession"
 SAVE_BASE="eval_results/fgat_ablations"
+mkdir -p "$SAVE_BASE"
 
 # Same 3 subjects as benchmark_v2
 SUBJECT_TRIALS=("1 1" "3 0" "7 0")
@@ -62,48 +63,54 @@ echo "========================================================"
 echo "FGAT Ablation Study"
 echo "  Baseline: fgat_medium (D=96, layers=2)"
 echo "  Variants: no_graph_bias / single_graph / no_reref / mean_pool"
-echo "  Subjects: sub1_trial1, sub3_trial0, sub7_trial0"
+echo "  Subjects: sub1_trial1, sub3_trial0, sub7_trial0 (parallel, one per GPU)"
 echo "  Tasks   : $TASKS"
 echo "  Output  : $SAVE_BASE"
 echo "========================================================"
 echo ""
 
-for ST in "${SUBJECT_TRIALS[@]}"; do
-    S=$(echo "$ST" | cut -d' ' -f1)
-    T=$(echo "$ST" | cut -d' ' -f2)
+run_subject() {
+    local S=$1
+    local T=$2
+    local GPU=$3
 
-    # Baseline — full model
+    export CUDA_VISIBLE_DEVICES=$GPU
+
     run_ablation "fgat_full"         "$S" "$T" \
         --fgat_graph_bias true  --fgat_graph_type multiband \
         --fgat_reref fixed      --fgat_pooling gated
 
-    # Ablation 1: remove graph bias entirely
-    # If this matches fgat_full → graph contributes nothing
     run_ablation "fgat_no_graph"     "$S" "$T" \
         --fgat_graph_bias false --fgat_graph_type multiband \
         --fgat_reref fixed      --fgat_pooling gated
 
-    # Ablation 2: single wideband graph instead of 5-band
-    # If this matches fgat_full → band specificity adds nothing
     run_ablation "fgat_single_graph" "$S" "$T" \
         --fgat_graph_bias true  --fgat_graph_type single \
         --fgat_reref fixed      --fgat_pooling gated
 
-    # Ablation 3: no Laplacian rereferencing
-    # If this drops → reref is important
     run_ablation "fgat_no_reref"     "$S" "$T" \
         --fgat_graph_bias true  --fgat_graph_type multiband \
         --fgat_reref none       --fgat_pooling gated
 
-    # Ablation 4: mean pooling instead of gated attention
-    # If this drops → gated pooling is important
     run_ablation "fgat_mean_pool"    "$S" "$T" \
         --fgat_graph_bias true  --fgat_graph_type multiband \
         --fgat_reref fixed      --fgat_pooling mean
+}
 
-    echo ""
-done
+# Run 3 subjects in parallel, each pinned to a separate GPU.
+# Ablations within each subject run sequentially to avoid OOM.
+run_subject 1 1 0 > "${SAVE_BASE}/log_sub1.txt" 2>&1 &
+run_subject 3 0 1 > "${SAVE_BASE}/log_sub3.txt" 2>&1 &
+run_subject 7 0 2 > "${SAVE_BASE}/log_sub7.txt" 2>&1 &
 
+echo "3 subject workers running in background (GPU 0/1/2)."
+echo "Monitor with:"
+echo "  tail -f ${SAVE_BASE}/log_sub1.txt"
+echo "  tail -f ${SAVE_BASE}/log_sub3.txt"
+echo "  tail -f ${SAVE_BASE}/log_sub7.txt"
+echo ""
+
+wait
 echo "========================================================"
 echo "Ablations complete. Results in: $SAVE_BASE"
 echo ""
