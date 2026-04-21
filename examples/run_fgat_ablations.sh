@@ -29,7 +29,7 @@ export NEUROPROBE_FEATURES_FILE="${NEUROPROBE_FEATURES_FILE:-features.csv}"
 
 TASKS="onset,speech,volume,gpt2_surprisal,word_length"
 SPLIT="WithinSession"
-SAVE_BASE="eval_results/fgat_ablations"
+SAVE_BASE="eval_results/fgat_ablations_v2"
 mkdir -p "$SAVE_BASE"
 
 # Same 3 subjects as benchmark_v2
