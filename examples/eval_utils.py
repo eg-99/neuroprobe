@@ -306,10 +306,41 @@ def laplacian_rereference_neural_data(electrode_data, electrode_labels, remove_n
 
     return rereferenced_data, laplacian_electrodes if remove_non_laplacian else electrode_labels, original_electrode_indices
 
+def bandpower_from_stft(data, sampling_rate=2048, nperseg=512):
+    """Collapse STFT output (batch, E, T, F) → (batch, E, 1, 5) band-averaged power.
+
+    Bands: theta 4-8, alpha 8-13, beta 13-30, low_gamma 30-70, high_gamma 70-150 Hz.
+    Input data must already be STFT magnitude (batch, E, timebins, freqs).
+    """
+    BANDS = [(4, 8), (8, 13), (13, 30), (30, 70), (70, 150)]
+    freqs = np.linspace(0, sampling_rate / 2, nperseg // 2 + 1)
+    # clip freqs to the range present in data
+    n_freqs = data.shape[-1]
+    freqs = freqs[:n_freqs]
+
+    band_powers = []
+    for lo, hi in BANDS:
+        mask = (freqs >= lo) & (freqs <= hi)
+        if not mask.any():
+            band_powers.append(np.zeros(data.shape[:2] + (1,), dtype=data.dtype))
+        else:
+            # mean over time bins and freq bins in band → (batch, E)
+            bp = data[:, :, :, mask].mean(axis=(2, 3), keepdims=False)  # (batch, E)
+            band_powers.append(bp[:, :, np.newaxis])  # (batch, E, 1)
+    # stack bands → (batch, E, 5) → add timebin dim → (batch, E, 1, 5)
+    return np.stack(band_powers, axis=-1)  # (batch, E, 1, 5)
+
+
 def preprocess_data(data, electrode_labels, preprocess, preprocess_parameters):
     for preprocess_option in preprocess.split('-'):
         if preprocess_option.lower() in ['stft_absangle', 'stft_realimag', 'stft_abs']:
             data = preprocess_stft(data, preprocess=preprocess_option, preprocess_parameters=preprocess_parameters)
+        elif preprocess_option.lower() == 'bandpower':
+            # expects data already passed through stft_abs; if not, run stft first
+            if not (isinstance(data, np.ndarray) and data.ndim == 4):
+                data = preprocess_stft(data, preprocess='stft_abs', preprocess_parameters=preprocess_parameters)
+            nperseg = preprocess_parameters['stft']['nperseg']
+            data = bandpower_from_stft(data, nperseg=nperseg)
         elif preprocess_option.lower() == 'remove_line_noise':
             data = remove_line_noise(data)
         elif preprocess_option.lower() == 'downsample_200':
