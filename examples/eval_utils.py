@@ -336,11 +336,15 @@ def preprocess_data(data, electrode_labels, preprocess, preprocess_parameters):
         if preprocess_option.lower() in ['stft_absangle', 'stft_realimag', 'stft_abs']:
             data = preprocess_stft(data, preprocess=preprocess_option, preprocess_parameters=preprocess_parameters)
         elif preprocess_option.lower() == 'bandpower':
-            # expects data already passed through stft_abs; if not, run stft first
+            was_tensor = isinstance(data, torch.Tensor)
             if not (isinstance(data, np.ndarray) and data.ndim == 4):
                 data = preprocess_stft(data, preprocess='stft_abs', preprocess_parameters=preprocess_parameters)
+            if isinstance(data, torch.Tensor):
+                data = data.numpy()
             nperseg = preprocess_parameters['stft']['nperseg']
             data = bandpower_from_stft(data, nperseg=nperseg)
+            if was_tensor:
+                data = torch.from_numpy(data)
         elif preprocess_option.lower() == 'remove_line_noise':
             data = remove_line_noise(data)
         elif preprocess_option.lower() == 'downsample_200':
